@@ -103,8 +103,8 @@ def apply_bias(x, y):
 # Model (must match training: 1x50x200, Sigmoid output)
 # =========================
 class EyeGazeCNN(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
+    def _init_(self):
+        super()._init_()
         self.conv1 = torch.nn.Conv2d(1, 32, 5, 1, 2)
         self.conv2 = torch.nn.Conv2d(32, 64, 5, 1, 2)
         self.pool = torch.nn.MaxPool2d(2, 2, 0)
@@ -237,16 +237,23 @@ def calib_path():
     return os.path.join(CALIB_DIR, f"cubic_{W}x{H}.npz")
 
 
-def save_calibration(wx, wy):
-    np.savez(calib_path(), wx=wx, wy=wy)
-
+def save_calibration(wx, wy, A, t):
+    np.savez(calib_path(), wx=wx, wy=wy, A=A, t=t)
 
 def load_calibration():
     p = calib_path()
-    if os.path.exists(p):
-        d = np.load(p)
-        return d["wx"].astype(np.float32), d["wy"].astype(np.float32)
-    return None
+    if not os.path.exists(p):
+        return None
+    d = np.load(p)
+    wx = d["wx"].astype(np.float32)
+    wy = d["wy"].astype(np.float32)
+    A  = d["A"].astype(np.float32) if "A" in d else np.eye(2, dtype=np.float32)
+    t  = d["t"].astype(np.float32) if "t" in d else np.zeros(2, dtype=np.float32)
+    return wx, wy, A, t
+
+
+
+
 
 
 def poly_features_cubic(nx, ny):
@@ -257,11 +264,27 @@ def poly_features_cubic(nx, ny):
     )
 
 
-def solve_cubic(xs_norm, ys_pix):
-    Phi = np.vstack([poly_features_cubic(nx, ny) for nx, ny in xs_norm])  # N x 10
-    wx = np.linalg.lstsq(Phi, ys_pix[:, 0], rcond=None)[0]
-    wy = np.linalg.lstsq(Phi, ys_pix[:, 1], rcond=None)[0]
+def solve_cubic(xs_norm, ys_pix, lam=1e-3):
+    Phi = np.vstack([poly_features_cubic(nx, ny) for nx, ny in xs_norm]).astype(np.float32)  # N x 10
+    Y  = np.asarray(ys_pix, dtype=np.float32)  # N x 2
+    A  = Phi.T @ Phi + lam * np.eye(Phi.shape[1], dtype=np.float32)
+    wx = np.linalg.solve(A, Phi.T @ Y[:,0])
+    wy = np.linalg.solve(A, Phi.T @ Y[:,1])
     return wx.astype(np.float32), wy.astype(np.float32)
+
+def fit_affine(X_pred, Y_true):
+    # X_pred, Y_true: (N,2) pixels
+    N = X_pred.shape[0]
+    M = np.concatenate([X_pred, np.ones((N,1), np.float32)], axis=1)  # (N,3)
+    # Solve for each axis: M @ [a11 a12 tx]^T = Yx, M @ [a21 a22 ty]^T = Yy
+    pa, _, _, _ = np.linalg.lstsq(M, Y_true[:,0], rcond=None)
+    pb, _, _, _ = np.linalg.lstsq(M, Y_true[:,1], rcond=None)
+    A = np.array([[pa[0], pa[1]],[pb[0], pb[1]]], dtype=np.float32)
+    t = np.array([pa[2], pb[2]], dtype=np.float32)
+    return A, t
+
+def apply_affine(p, A, t):
+    return (A @ p) + t
 
 
 def apply_cubic(nx, ny, wx, wy):
@@ -310,8 +333,12 @@ def run_quick_calibration(cam):
             preds.append(np.mean(np.array(samples), axis=0))
             pix.append([x, y])
     cv.destroyWindow("Calib")
+    # after collecting preds (norm) and pix (true)…
     wx, wy = solve_cubic(np.array(preds), np.array(pix))
-    return (wx, wy)
+    pix_hat = np.array([apply_cubic(nx, ny, wx, wy) for (nx, ny) in preds], dtype=np.float32)
+    A, t = fit_affine(pix_hat, np.array(pix, dtype=np.float32))
+    # Save inside here OR just return and let main save. I recommend: return.
+    return wx, wy, A, t
 
 
 # =========================
@@ -344,7 +371,7 @@ FREEZE_ON_BLINK = True
 def main():
     global ENABLE_DWELL_ZOOM
 
-    cam = cv.VideoCapture(1)
+    cam = cv.VideoCapture(0)
     if not cam.isOpened():
         cam = cv.VideoCapture(0)
     if not cam.isOpened():
@@ -352,22 +379,24 @@ def main():
         return
 
     # Load cached calibration (or run if requested)
-    wx_wy = load_calibration()
-    if wx_wy is None:
-        print("No cached calibration found.")
+    calib = load_calibration()
+    if calib is None:
         if RUN_CALIBRATION:
-            print("Calibration... SPACE at each dot (ESC to cancel)")
             out = run_quick_calibration(cam)
-            if out is None:
-                print("Calibration cancelled. Using raw mapping.")
-            else:
-                wx_wy = out
-                save_calibration(wx_wy[0], wx_wy[1])
+            if out is not None:
+                wx, wy, A, t = out
+                save_calibration(wx, wy, A, t)    # ✅ save all four
                 print("Calibration complete and saved.")
+            else:
+                print("Calibration cancelled. Using raw mapping.")
+                wx = wy = A = t = None
         else:
-            print("Skipping calibration (RUN_CALIBRATION=False). Using raw mapping.")
+            print("Skipping calibration. Using raw mapping.")
+            wx = wy = A = t = None
     else:
+        wx, wy, A, t = calib
         print("Loaded cached calibration.")
+
 
     hist = deque(maxlen=9)  # median window
     alpha = 0.85  # EMA factor
@@ -408,10 +437,14 @@ def main():
                 nx, ny = model(ten).squeeze(0).cpu().numpy().tolist()
 
             # map to pixels (use calibration if available)
-            if wx_wy is not None:
-                fx, fy = apply_cubic(nx, ny, wx_wy[0], wx_wy[1])
+            # map to pixels (use calibration if available)
+            if (wx is not None) and (wy is not None):
+                fx, fy = apply_cubic(nx, ny, wx, wy)
+                if (A is not None) and (t is not None):
+                    fx, fy = apply_affine(np.array([fx, fy], dtype=np.float32), A, t)
             else:
                 fx, fy = nx * W, ny * H
+
 
             # bias trim
             fx, fy = apply_bias(fx, fy)
@@ -499,12 +532,13 @@ def main():
             k = cv.waitKey(1) & 0xFF
             if k == ord("q"):
                 break
-            if k == ord("r"):  # recalibrate
+            if k == ord("r"):
                 out = run_quick_calibration(cam)
                 if out is not None:
-                    wx_wy = out
-                    save_calibration(wx_wy[0], wx_wy[1])
+                    wx, wy, A, t = out
+                    save_calibration(wx, wy, A, t)
                     print("Re-calibrated and saved.")
+
             if k == ord("z"):  # toggle dwell zoom
                 ENABLE_DWELL_ZOOM = not ENABLE_DWELL_ZOOM
                 if not ENABLE_DWELL_ZOOM:
@@ -540,5 +574,5 @@ def main():
             pass
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":             # <-- fix
     main()
