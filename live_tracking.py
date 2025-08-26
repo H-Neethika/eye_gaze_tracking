@@ -39,6 +39,7 @@ def get_screen_size():
             user32 = ctypes.windll.user32
             # Ensure DPI awareness (redundant call is harmless)
             user32.SetProcessDPIAware()
+            print("display size:", user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
             return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
         except Exception:
             pass
