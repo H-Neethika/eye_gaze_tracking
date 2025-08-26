@@ -1,0 +1,22 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore virtual environments
+.venv/
+env/
+venv/
+
+# Ignore calibration and test folders
+.calib/
+testeyes/
+
+# Ignore model checkpoints / weights
+*.pth
+*.pt
+
+# Ignore system files
+.DS_Store
+Thumbs.db
