@@ -12,6 +12,7 @@ venv/
 # Ignore calibration and test folders
 .calib/
 testeyes/
+eye_images/
 
 # Ignore model checkpoints / weights
 *.pth
